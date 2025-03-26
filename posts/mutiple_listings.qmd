@@ -1,0 +1,415 @@
+---
+title: "Multiple Listings Issue"
+author: "Molly White"
+categories: ["Data Cleaning", "Kidney Allocation", "R"]
+date: "3/22/2024"
+format: html
+---
+
+Some patients registered for kidney or other organ transplants may be listed for a transplant at multiple centers. Failing to account for these multiple listings can lead to incorrect results in analyses of waitlist outcomes for these patients. In this post, we will go over the methods we used to deal with this multiple listings issue for our manuscript *Association of Race and Ethnicity with Priority for Deceased Donor Kidney Transplant*.
+
+```{r}
+#| echo: false
+#| warning: false
+
+library(tidyverse)
+library(lubridate)
+library(haven)
+library(kableExtra)
+library(gridExtra)
+
+
+start_date <- '2015-01-01'
+end_date <- '2020-12-31'
+living_donor_recips <- TRUE
+
+df_cand_kipa_all <- haven::read_sas('C:/Users/mhwhi/Downloads/cand_kipa.sas7bdat') %>%
+  filter(as.Date(CAN_LISTING_DT) >= start_date & as.Date(CAN_LISTING_DT) <= end_date) %>%
+  filter(WL_ORG == 'KI') %>%
+  filter(CAN_AGE_AT_LISTING >= 18)
+
+
+num_adult_registrations <- df_cand_kipa_all$PX_ID %>% unique() %>% length()
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+
+set.seed(123)  # for reproducibility
+
+
+unique_pers_id <- unique(df_cand_kipa_all$PERS_ID)
+unique_px_id <- unique(df_cand_kipa_all$PX_ID)
+
+pers_numbers <- sample.int(300000, length(unique_pers_id), replace = FALSE)
+px_numbers <- sample.int(300000, length(unique_px_id), replace = FALSE)
+
+# Create a mapping between original IDs and random numbers
+id_map_pers <- setNames(pers_numbers, unique_pers_id)
+id_map_px <- setNames(px_numbers, unique_px_id)
+
+# Assign random numbers to all occurrences of each ID
+df_cand_kipa_all <- df_cand_kipa_all %>%
+  mutate(
+    pers_id = unname(id_map_pers[match(PERS_ID, unique_pers_id)]),
+    px_id = unname(id_map_px[match(PX_ID, unique_px_id)])
+  )
+
+```
+
+::: callout-note
+All lowercase variables are ones we created, all uppercase variables already exist in the SRTR dataset. For privacy, we have anonymized ID numbers and dates, all of which are stored in lowercase versions of the original variable names.
+:::
+
+For all patients, we define the waitlist end date as the date of transplant, removal, last date of active status, or last date of inactive status:
+
+```{r}
+#| warning: false
+
+
+df_cand_kipa <- df_cand_kipa_all %>%
+  mutate(waitlist_end_date = case_when(
+    is.na(REC_TX_DT) == FALSE ~ REC_TX_DT,
+    is.na(CAN_REM_DT) == FALSE ~ CAN_REM_DT,
+    is.na(CAN_LAST_INACT_STAT_DT) == FALSE & CAN_LAST_INACT_STAT_DT > CAN_LAST_ACT_STAT_DT ~ CAN_LAST_INACT_STAT_DT,
+    !is.na(CAN_LAST_ACT_STAT_DT) ~ CAN_LAST_ACT_STAT_DT,
+    is.na(CAN_LAST_ACT_STAT_DT) & !is.na(CAN_LAST_INACT_STAT_DT) ~ CAN_LAST_INACT_STAT_DT,
+    TRUE ~ CAN_LAST_ACT_STAT_DT)
+    )
+
+
+```
+
+For patients who only have one listing, their minimum list date and wait time are defined as follows:
+
+-   **min_list_date** is equivalent to the **CAN_LISTING_DT**
+
+-   **wait_time** is the difference between their **waitlist_end_date** and their **min_list_date**
+
+```{r}
+#| warning: false
+
+
+single_registrations <- df_cand_kipa %>%
+  group_by(PERS_ID) %>%
+  mutate(num_list = n()) %>%
+  filter(num_list == 1) %>%
+  ungroup() %>% 
+  mutate(min_list_date = CAN_LISTING_DT,
+         wait_time = waitlist_end_date - min_list_date,
+         outcome = case_when(
+           DON_TY == "C" ~ "DDKT",
+           DON_TY == "L" ~ "LDKT",
+           is.na(CAN_REM_CD) == FALSE ~ "removed/died",
+           TRUE ~ "censored"
+         ))
+
+
+```
+
+In the SRTR data set, there are two codes used to identify a patient: PERS_ID and PX_ID. PX_ID is the identifier for a patient's unique transplant registration, whereas PERS_ID is unique to just the patient. So, for one PERS_ID, there could be several PX_ID codes.
+
+```{r}
+#| echo: false
+#| warning: false
+multiple_registrations <- df_cand_kipa %>%
+  filter(!PX_ID %in% single_registrations$PX_ID) %>%
+  group_by(PERS_ID) %>%
+  arrange(PERS_ID, CAN_LISTING_DT) %>%
+  mutate(num_list = n())
+
+
+candidates_w_multiple_registrations <- multiple_registrations %>% pull(PERS_ID) %>% unique() %>% length()
+
+avg_num_registrations_multiple <- mean(multiple_registrations %>% group_by(PERS_ID) %>% filter(row_number() ==1) %>% pull(num_list))
+
+missing = multiple_registrations %>% group_by(PERS_ID) %>% filter(n_distinct(waitlist_end_date) > 1) %>% select(PERS_ID, waitlist_end_date)
+
+
+
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+data = head(ungroup(multiple_registrations) %>% select(pers_id, px_id), 10)
+
+knitr::kable(
+  data[1:10, 1:2], table.attr = "style='width:30%;'"
+) %>% kable_styling(full_width = F)
+```
+
+There are two types of candidates that we classify as "multiple listed": concurrent and sequential. Those who are listed at multiple centers at once are concurrently listed and those who are listed at multiple centers one after the other are sequentially listed.
+
+Our goal is to consolidate instances of a patient being listed at multiple centers concurrently, but to treat sequential listings as separate observations. So, there may be multiple observations for one PERS_ID, as long as those observations represent non-overlapping time on the waitlist.
+
+To distinguish between each type of listing we will label them as follows:
+
+```{r}
+multiple_registrations <- multiple_registrations %>%
+  mutate(list_type = case_when(
+    CAN_LISTING_DT < lag(waitlist_end_date) ~ "concurrent",
+    waitlist_end_date > lead(CAN_LISTING_DT) ~ "concurrent",
+    TRUE ~ "sequential")) %>%
+  mutate(REC_TX_DT = as.Date(REC_TX_DT)) %>%
+  mutate(num_tx = length(unique(na.omit(REC_TX_DT)))) %>%
+  fill(REC_TX_DT, .direction='downup')
+
+```
+
+Some patients receive multiple transplants, and therefore have multiple values for "REC_TX_DT". To account for this, we implement a counter that changes value whenever the transplant date changes but the PERS_ID is the same. We then fill this value down the rows such that if the last row had a different counter value but the PERS_ID stays the same, the counter changes.
+
+```{r}
+
+## Relocate order (sort) function
+multiple_registrations <- multiple_registrations[order(multiple_registrations$PERS_ID, multiple_registrations$waitlist_end_date), ]
+
+
+## Retransplant counter
+multiple_registrations$transplant_num <- 1
+
+
+## If transplant date changed from previous row to current row but person ID stayed the same, counter + 1
+for(i in 2:nrow(multiple_registrations)) {
+  if(multiple_registrations$PERS_ID[i-1] == multiple_registrations$PERS_ID[i] &
+     multiple_registrations$REC_TX_DT[i-1] != multiple_registrations$REC_TX_DT[i] &
+     !is.na(multiple_registrations$REC_TX_DT[i])) {
+    
+    multiple_registrations$transplant_num[i] = multiple_registrations$transplant_num[i-1] + 1
+     } 
+}
+
+for(i in 2:nrow(multiple_registrations)) {
+  if(multiple_registrations$PERS_ID[i-1] == multiple_registrations$PERS_ID[i] &
+     multiple_registrations$transplant_num[i-1] != multiple_registrations$transplant_num[i] &
+     multiple_registrations$transplant_num[i-1] != 1) {
+    
+    multiple_registrations$transplant_num[i] = multiple_registrations$transplant_num[i-1]
+     } 
+}
+
+```
+
+</br>
+
+Filling the data can sometimes lead to incorrect values. In our case, we had to correct wrong transplant dates by filling earlier values with the latter transplant date for concurrent observations within the same PERS_ID.
+
+```{r}
+
+## Change the counter value back to 0 for sequential
+multiple_registrations$transplant_num[multiple_registrations$list_type == 'sequential'] <- 0
+
+
+## Unusual cases when filling data leads to incorrect transplant date
+## Correct by taking the latter transplant date
+for(i in 1:(nrow(multiple_registrations)-1)) {
+  if(multiple_registrations$PERS_ID[i] == multiple_registrations$PERS_ID[i+1] &
+     multiple_registrations$list_type[i] == 'concurrent' & multiple_registrations$list_type[i+1] == 'concurrent' &
+     !is.na(multiple_registrations$REC_TX_DT[i]) & !is.na(multiple_registrations$REC_TX_DT[i+1]) &
+     multiple_registrations$REC_TX_DT[i] < multiple_registrations$REC_TX_DT[i+1] ) {
+    
+    multiple_registrations$REC_TX_DT[i] <- multiple_registrations$REC_TX_DT[i+1] 
+     }
+}
+
+sequential_lists <- multiple_registrations %>%
+  filter(list_type == "sequential") %>%
+  mutate(min_list_date = CAN_LISTING_DT,
+         wait_time = waitlist_end_date - min_list_date,
+         outcome = case_when(
+           DON_TY == "C" ~ "DDKT",
+           DON_TY == "L" ~ "LDKT",
+           is.na(CAN_REM_CD) == FALSE ~ "removed/died",
+           TRUE ~ "censored"
+         ))
+
+## How many possible transplants do we need to account for
+max_retransplants <- max(multiple_registrations$transplant_num)
+
+
+## Minimum list date for each concurrent transplant
+multiple_registrations <- multiple_registrations %>%
+  group_by(PERS_ID, transplant_num) %>%
+  mutate(min_list_date = min(CAN_LISTING_DT, na.rm=T),
+         wait_time = waitlist_end_date - min_list_date)
+
+
+```
+
+```{r}
+#| echo: false
+single_registrations = single_registrations %>% mutate(
+  list_date = mdy('1/1/2000'),
+  waitlist_end_date = mdy('1/1/2000') + wait_time,
+  rec_tx_dt = case_when(
+  !is.na(REC_TX_DT) ~ list_date + wait_time,
+  TRUE ~ NA
+)
+)
+
+sequential_lists = sequential_lists %>% mutate(
+  list_date = mdy('1/1/2000'),
+  waitlist_end_date = mdy('1/1/2000') + wait_time,
+  rec_tx_dt = case_when(
+    !is.na(REC_TX_DT) ~ list_date + wait_time,
+    TRUE ~ NA
+)
+)
+
+multiple_registrations = multiple_registrations %>% mutate(
+  list_date = mdy('1/1/2000'))
+
+multiple_registrations = multiple_registrations %>% group_by(PERS_ID) %>% 
+  mutate(min_list_diff = min_list_date - first(min_list_date),
+         can_list_diff = CAN_LISTING_DT - min(CAN_LISTING_DT),
+         can_listing_dt = list_date + can_list_diff,
+         list_date = list_date + min_list_diff,
+         rec_tx_dt = case_when(
+           !is.na(REC_TX_DT) ~ list_date + wait_time,
+           TRUE ~ NA
+),
+         waitlist_end_date = list_date + wait_time)
+```
+
+To collapse these concurrent listings, we want one observation for each patient at each "transplant number".
+
+```{r}
+
+collapsed_concurrent_registrations <- NULL
+for(i in 1:max_retransplants) {
+  
+  collapsed_concurrent_registrations <- rbind(collapsed_concurrent_registrations, 
+        
+  multiple_registrations %>%
+    filter(list_type == "concurrent" & transplant_num == i) %>% ## Do it separately for each transplant counter number
+    mutate(DON_TY = ifelse(DON_TY == "", NA, DON_TY),
+           last_wait_date = max(waitlist_end_date, na.rm = TRUE)) %>%
+    fill(REC_TX_DT, .direction = "up") %>%
+    fill(DON_TY, .direction = "up") %>%
+    fill(DONOR_ID, .direction = "up") %>%
+    fill(CAN_REM_CD, .direction = "up") %>%
+    mutate(wait_time = case_when(
+      is.na(REC_TX_DT) == FALSE & transplant_num != '0' ~ REC_TX_DT- min_list_date, ### Ignore non-transplanted rows
+      TRUE ~ last_wait_date - min_list_date),
+      outcome = case_when(
+        DON_TY == "C" ~ "DDKT",
+        DON_TY == "L" ~ "LDKT",
+        is.na(CAN_REM_CD) == FALSE ~ "removed/died",
+        TRUE ~ "censored")
+    ) %>%
+    select(-c(waitlist_end_date, CAN_LISTING_DT, CAN_REM_DT)) %>%
+    filter(row_number() ==1) %>%
+    
+    mutate(last_wait_date = case_when(
+      REC_TX_DT < last_wait_date ~ REC_TX_DT,
+      TRUE ~last_wait_date))) 
+  
+}
+
+```
+
+So this...
+
+```{r}
+#| echo: false
+# multiple_registrations %>% filter(list_type == 'concurrent')
+
+data = multiple_registrations %>% select(pers_id, px_id, num_list, transplant_num, list_type, rec_tx_dt, PERS_ID) %>% group_by(pers_id)  %>%
+  filter(list_type == "concurrent") %>%
+  filter(n_distinct(transplant_num) > 1) %>%
+  ungroup()
+
+knitr::kable(
+  data[1:13, 1:6]
+)
+```
+
+</br>
+
+Turns into this:
+
+```{r}
+#| echo: false
+ids = unique(data$pers_id[1:10])
+
+knitr::kable(
+  (collapsed_concurrent_registrations %>% filter(pers_id %in% ids) %>% select(pers_id, px_id, rec_tx_dt, num_list, transplant_num, list_type, PERS_ID) %>% arrange(pers_id))[,1:6]
+)
+
+```
+
+</br>
+
+In some cases, there are multiple rounds of concurrent listings. Here is an example of such an edge case, where a patient is has 3 concurrent listings and receives a transplant, and then has concurrent relistings.
+
+```{r}
+#| echo: false
+#| warning: false
+case_check_concurrent = multiple_registrations %>% 
+  group_by(pers_id) %>%
+  mutate(list_num = row_number(),
+         num_tx = n_distinct(REC_TX_DT, na.rm = TRUE)) %>%
+  select(pers_id, list_num, list_type, can_listing_dt, waitlist_end_date, num_tx, rec_tx_dt, CAN_LISTING_DT, PERS_ID) %>%
+  filter(PERS_ID == 2255750)
+
+knitr::kable(
+  case_check_concurrent[1:6, 1:7]
+)
+
+```
+
+</br>
+
+This patient's observations are collapsed into two observations, reflecting their original time on the waitlist, as well as their relisted period:
+
+```{r}
+#| echo: false
+#| warning: false
+case_check_collapsed = collapsed_concurrent_registrations %>%
+  select(pers_id, list_type, can_listing_dt, last_wait_date, num_tx, rec_tx_dt, PERS_ID) %>%
+  filter(PERS_ID == 2255750)
+
+knitr::kable(
+  case_check_collapsed[1:2, 1:6]
+)
+```
+
+</br>
+
+Finally, we recombine the collapsed concurrent registrations with the single registrations and sequential listings, to form one dataset.
+
+```{r}
+#| echo: false
+
+#combine last wait date and waitlist end date.
+df_cand_kipa <- bind_rows(single_registrations %>% ungroup(), 
+                          sequential_lists %>% ungroup(), 
+                          collapsed_concurrent_registrations %>% ungroup())
+
+df_cand_kipa = df_cand_kipa %>% mutate(
+  last_wait_date = case_when(
+  !is.na(last_wait_date) ~ last_wait_date,
+  TRUE ~ waitlist_end_date
+))
+
+final = ungroup(df_cand_kipa) %>% select(pers_id, px_id, min_list_date, last_wait_date, wait_time, outcome)
+final = final[1:1000,]
+
+# knitr::kable(
+  # final
+# ) %>% scroll_box(height = "300px")
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+
+final = final[1:10,]
+
+grid.table(final)
+
+```
